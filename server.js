@@ -31,8 +31,8 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }
 });
 
-// Store for SSE clients
-const sseClients = new Set();
+// Store for SSE clients with heartbeat
+const sseClients = new Map();
 
 // MCP Server Info
 const MCP_SERVER_INFO = {
@@ -85,32 +85,50 @@ const TOOLS = [
   }
 ];
 
-// SSE endpoint for MCP protocol
+// SSE endpoint with heartbeat
 app.get('/sse', (req, res) => {
+  // Set headers for SSE
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no' // Disable buffering in nginx
   });
 
-  // Add client to set
-  sseClients.add(res);
-
+  const clientId = Date.now();
+  
   // Send initial connection message
   sendSSE(res, 'connected', { 
     message: 'Connected to Origin Brain Trainer MCP Server',
-    server: MCP_SERVER_INFO
+    server: MCP_SERVER_INFO,
+    clientId: clientId
   });
+
+  // Set up heartbeat every 15 seconds
+  const heartbeat = setInterval(() => {
+    sendSSE(res, 'heartbeat', { 
+      timestamp: new Date().toISOString(),
+      status: 'alive'
+    });
+  }, 15000);
+
+  // Store client with heartbeat
+  sseClients.set(clientId, { res, heartbeat });
+
+  console.log(`✅ SSE Client ${clientId} connected. Total clients: ${sseClients.size}`);
 
   // Handle client disconnect
   req.on('close', () => {
-    sseClients.delete(res);
+    clearInterval(heartbeat);
+    sseClients.delete(clientId);
+    console.log(`❌ SSE Client ${clientId} disconnected. Total clients: ${sseClients.size}`);
   });
 });
 
 // MCP Initialize endpoint
 app.post('/mcp/initialize', (req, res) => {
+  console.log('📡 MCP Initialize request received');
   res.json({
     protocolVersion: "2024-11-05",
     serverInfo: MCP_SERVER_INFO,
@@ -120,6 +138,7 @@ app.post('/mcp/initialize', (req, res) => {
 
 // MCP List Tools endpoint
 app.post('/mcp/tools/list', (req, res) => {
+  console.log('🔧 MCP Tools list request received');
   res.json({
     tools: TOOLS
   });
@@ -128,6 +147,7 @@ app.post('/mcp/tools/list', (req, res) => {
 // MCP Call Tool endpoint
 app.post('/mcp/tools/call', async (req, res) => {
   const { name, arguments: args } = req.body;
+  console.log(`⚡ MCP Tool called: ${name}`, args);
 
   try {
     let result;
@@ -144,8 +164,9 @@ app.post('/mcp/tools/call', async (req, res) => {
       case 'upload_file':
         result = {
           success: true,
-          message: "File upload endpoint ready. Use POST /upload to upload files.",
-          instructions: args.instructions || "No instructions provided"
+          message: "File upload endpoint ready. Use POST /upload with multipart/form-data to upload files.",
+          instructions: args.instructions || "No instructions provided",
+          uploadEndpoint: "/upload"
         };
         break;
       
@@ -163,6 +184,7 @@ app.post('/mcp/tools/call', async (req, res) => {
     });
 
   } catch (error) {
+    console.error('❌ Tool execution error:', error);
     res.status(500).json({
       error: {
         code: "TOOL_ERROR",
@@ -199,7 +221,8 @@ app.post('/upload', upload.any(), (req, res) => {
     broadcastSSE('upload', {
       fileCount: files.length,
       files: processedFiles,
-      instructions: instructions
+      instructions: instructions,
+      timestamp: new Date().toISOString()
     });
 
     res.json({
@@ -213,7 +236,7 @@ app.post('/upload', upload.any(), (req, res) => {
     });
 
   } catch (error) {
-    console.error('Upload error:', error);
+    console.error('❌ Upload error:', error);
     res.status(500).json({
       success: false,
       error: error.message
@@ -230,6 +253,7 @@ async function listFiles() {
     return {
       name: filename,
       size: stats.size,
+      sizeFormatted: formatFileSize(stats.size),
       created: stats.birthtime,
       modified: stats.mtime
     };
@@ -238,7 +262,8 @@ async function listFiles() {
   return {
     success: true,
     count: fileDetails.length,
-    files: fileDetails
+    files: fileDetails,
+    timestamp: new Date().toISOString()
   };
 }
 
@@ -247,41 +272,77 @@ async function deleteFile(filename) {
   
   if (fs.existsSync(filepath)) {
     fs.unlinkSync(filepath);
+    
+    // Broadcast deletion to SSE clients
+    broadcastSSE('file_deleted', {
+      filename: filename,
+      timestamp: new Date().toISOString()
+    });
+    
     return {
       success: true,
-      message: `File ${filename} deleted successfully`
+      message: `File ${filename} deleted successfully`,
+      timestamp: new Date().toISOString()
     };
   } else {
     throw new Error('File not found');
   }
 }
 
+function formatFileSize(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+}
+
 function sendSSE(res, event, data) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+  try {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  } catch (error) {
+    console.error('❌ Error sending SSE:', error);
+  }
 }
 
 function broadcastSSE(event, data) {
-  sseClients.forEach(client => {
-    sendSSE(client, event, data);
+  console.log(`📢 Broadcasting SSE event: ${event} to ${sseClients.size} clients`);
+  sseClients.forEach((client, clientId) => {
+    try {
+      sendSSE(client.res, event, data);
+    } catch (error) {
+      console.error(`❌ Failed to send to client ${clientId}:`, error);
+      clearInterval(client.heartbeat);
+      sseClients.delete(clientId);
+    }
   });
 }
 
-// Health check
+// Health check with detailed info
 app.get('/', (req, res) => {
   res.json({
     status: 'MCP Server Running',
     message: 'Origin Brain Trainer MCP Server',
     version: '1.0.0',
     protocol: 'MCP with SSE',
+    activeConnections: sseClients.size,
     endpoints: {
       sse: '/sse',
       initialize: '/mcp/initialize',
       tools_list: '/mcp/tools/list',
       tools_call: '/mcp/tools/call',
-      upload: '/upload'
-    }
+      upload: '/upload',
+      files: '/files'
+    },
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString()
   });
+});
+
+// Keep-alive endpoint for Railway
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
 });
 
 // List files endpoint
@@ -312,11 +373,21 @@ app.delete('/files/:filename', async (req, res) => {
 
 // Error handling
 app.use((error, req, res, next) => {
-  console.error('Server error:', error);
+  console.error('❌ Server error:', error);
   res.status(500).json({
     success: false,
     error: 'Internal server error'
   });
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('⚠️ SIGTERM received, closing server...');
+  sseClients.forEach((client, clientId) => {
+    clearInterval(client.heartbeat);
+    client.res.end();
+  });
+  process.exit(0);
 });
 
 // Start server
@@ -325,7 +396,7 @@ app.listen(PORT, () => {
 ╔═══════════════════════════════════════════╗
 ║   🚀 MCP Server Running                   ║
 ║   Port: ${PORT}                              ║
-║   Protocol: MCP with SSE                  ║
+║   Protocol: MCP with SSE + Heartbeat      ║
 ║   SSE endpoint: /sse                      ║
 ║   Upload endpoint: /upload                ║
 ╚═══════════════════════════════════════════╝
