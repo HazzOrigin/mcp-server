@@ -1,18 +1,20 @@
-/**
- * Origin Brain Trainer MCP Server (Express + SSE + JSON-RPC /message)
- *
- * Fixes ChatGPT "timeout" during connector creation by implementing:
- *  - GET /sse  (server -> client event stream)
- *  - POST /message (client -> server JSON-RPC for initialize/tools/list/tools/call)
- *
- * Keeps your existing REST endpoints:
- *  - POST /upload
- *  - GET /files
- *  - DELETE /files/:filename
- *  - POST /mcp/initialize
- *  - POST /mcp/tools/list
- *  - POST /mcp/tools/call
- */
+// server.js
+//
+// Origin Brain Trainer MCP Server (Express)
+// - Single MCP endpoint /mcp that supports BOTH:
+//     GET  /mcp  -> SSE stream (server -> client)
+//     POST /mcp  -> JSON-RPC (client -> server): initialize, tools/list, tools/call
+// - Backwards-compatible aliases:
+//     GET  /sse      -> same as GET /mcp
+//     POST /message  -> same as POST /mcp
+// - File upload + file management endpoints remain the same.
+//
+// IMPORTANT for ChatGPT "New App" UI:
+//   Use MCP Server URL = https://mcp-server-production-067c.up.railway.app/mcp
+//
+// Railway:
+//   Set env var PUBLIC_BASE_URL=https://mcp-server-production-067c.up.railway.app
+//   (prevents http/https mismatch behind proxy)
 
 const express = require("express");
 const multer = require("multer");
@@ -21,21 +23,21 @@ const path = require("path");
 const fs = require("fs");
 
 const app = express();
-app.set("trust proxy", 1); // important behind Railway proxy
+app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
 
-// Enable CORS + JSON
+// Middleware
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
-// Create uploads directory
+// Uploads directory
 const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
-// Configure multer
+// Multer config
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
@@ -46,13 +48,13 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
-// Store for SSE clients with heartbeat
+// SSE clients
 const sseClients = new Map();
 
-// MCP Server Info
+// MCP info
 const MCP_SERVER_INFO = {
   name: "origin-brain-trainer",
   version: "1.0.0",
@@ -64,13 +66,14 @@ const MCP_SERVER_INFO = {
   },
 };
 
-// Available tools
+// Tools
 const TOOLS = [
   {
     name: "upload_file",
     description: "Upload files to the Origin Brain Trainer server with optional processing instructions",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         instructions: {
           type: "string",
@@ -83,24 +86,37 @@ const TOOLS = [
   {
     name: "list_files",
     description: "List all uploaded files",
-    inputSchema: { type: "object", properties: {}, required: [] },
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {},
+      required: [],
+    },
   },
   {
     name: "delete_file",
     description: "Delete a specific uploaded file",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
-        filename: { type: "string", description: "Name of the file to delete" },
+        filename: {
+          type: "string",
+          description: "Name of the file to delete",
+        },
       },
       required: ["filename"],
     },
   },
 ];
 
-/** -------------------------
- * Helpers
- * ------------------------*/
+// --------------------
+// Helpers
+// --------------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function formatFileSize(bytes) {
   if (bytes === 0) return "0 Bytes";
   const k = 1024;
@@ -113,8 +129,8 @@ function sendSSE(res, event, data) {
   try {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
-  } catch (error) {
-    console.error("❌ Error sending SSE:", error);
+  } catch (err) {
+    console.error("❌ Error sending SSE:", err);
   }
 }
 
@@ -123,8 +139,8 @@ function broadcastSSE(event, data) {
   sseClients.forEach((client, clientId) => {
     try {
       sendSSE(client.res, event, data);
-    } catch (error) {
-      console.error(`❌ Failed to send to client ${clientId}:`, error);
+    } catch (err) {
+      console.error(`❌ Failed to send to client ${clientId}:`, err);
       clearInterval(client.heartbeat);
       sseClients.delete(clientId);
     }
@@ -149,7 +165,7 @@ async function listFiles() {
     success: true,
     count: fileDetails.length,
     files: fileDetails,
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso(),
   };
 }
 
@@ -158,29 +174,24 @@ async function deleteFile(filename) {
 
   const filepath = path.join(uploadsDir, filename);
 
-  if (fs.existsSync(filepath)) {
-    fs.unlinkSync(filepath);
-
-    // Broadcast deletion to SSE clients
-    broadcastSSE("file_deleted", {
-      filename,
-      timestamp: new Date().toISOString(),
-    });
-
-    return {
-      success: true,
-      message: `File ${filename} deleted successfully`,
-      timestamp: new Date().toISOString(),
-    };
+  if (!fs.existsSync(filepath)) {
+    throw new Error("File not found");
   }
 
-  throw new Error("File not found");
+  fs.unlinkSync(filepath);
+
+  broadcastSSE("file_deleted", {
+    filename,
+    timestamp: nowIso(),
+  });
+
+  return {
+    success: true,
+    message: `File ${filename} deleted successfully`,
+    timestamp: nowIso(),
+  };
 }
 
-/**
- * Executes a tool and returns a "result object" (your internal tool result),
- * then the MCP wrapper will turn it into MCP response content.
- */
 async function executeTool(name, args) {
   switch (name) {
     case "list_files":
@@ -202,10 +213,19 @@ async function executeTool(name, args) {
   }
 }
 
-/** -------------------------
- * SSE endpoint (server -> client)
- * ------------------------*/
-app.get("/sse", (req, res) => {
+// Build base URL safely (Railway proxy)
+function getBaseUrl(req) {
+  // Strongly recommended: set PUBLIC_BASE_URL in Railway to the HTTPS public URL
+  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL;
+
+  // Fallback: infer from request (can be http behind proxy if trust proxy not set correctly)
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+// --------------------
+// MCP single endpoint: GET /mcp (SSE)
+// --------------------
+function handleMcpSse(req, res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -214,17 +234,12 @@ app.get("/sse", (req, res) => {
     "X-Accel-Buffering": "no",
   });
 
-  const clientId = Date.now(); // simple unique-ish id
+  const clientId = Date.now();
+  const baseUrl = getBaseUrl(req);
 
-  // Prefer explicit public base URL (Railway proxy can cause protocol issues)
-  const baseUrl =
-    process.env.PUBLIC_BASE_URL ||
-    `${req.protocol}://${req.get("host")}`;
+  // IMPORTANT: For "single endpoint" transport, postUrl should point back to /mcp
+  const postUrl = `${baseUrl}/mcp?clientId=${encodeURIComponent(clientId)}`;
 
-  // IMPORTANT: tell clients (ChatGPT) where to POST JSON-RPC requests
-  const postUrl = `${baseUrl}/message?clientId=${encodeURIComponent(clientId)}`;
-
-  // Initial connection message
   sendSSE(res, "connected", {
     message: "Connected to Origin Brain Trainer MCP Server",
     server: MCP_SERVER_INFO,
@@ -232,13 +247,10 @@ app.get("/sse", (req, res) => {
     postUrl,
   });
 
-  // Heartbeat every 15 seconds
+  // Heartbeat (8s to keep edges happy)
   const heartbeat = setInterval(() => {
-    sendSSE(res, "heartbeat", {
-      timestamp: new Date().toISOString(),
-      status: "alive",
-    });
-  }, 15000);
+    sendSSE(res, "heartbeat", { timestamp: nowIso(), status: "alive" });
+  }, 8000);
 
   sseClients.set(clientId, { res, heartbeat });
   console.log(`✅ SSE Client ${clientId} connected. Total clients: ${sseClients.size}`);
@@ -248,15 +260,19 @@ app.get("/sse", (req, res) => {
     sseClients.delete(clientId);
     console.log(`❌ SSE Client ${clientId} disconnected. Total clients: ${sseClients.size}`);
   });
-});
+}
 
-/** -------------------------
- * MCP JSON-RPC message endpoint (client -> server)
- * This is what ChatGPT expects.
- * ------------------------*/
-app.post("/message", async (req, res) => {
+// --------------------
+// MCP single endpoint: POST /mcp (JSON-RPC)
+// --------------------
+async function handleMcpMessage(req, res) {
   const clientId = req.query.clientId ? Number(req.query.clientId) : null;
   const rpc = req.body;
+
+  // Log what ChatGPT is doing (helpful during setup)
+  try {
+    console.log("📨 MCP RPC:", rpc?.method, "id:", rpc?.id, "clientId:", clientId || "n/a");
+  } catch (_) {}
 
   // Validate JSON-RPC-ish request
   if (!rpc || rpc.jsonrpc !== "2.0" || !rpc.method) {
@@ -268,7 +284,7 @@ app.post("/message", async (req, res) => {
   }
 
   try {
-    // 1) initialize
+    // initialize
     if (rpc.method === "initialize") {
       return res.json({
         jsonrpc: "2.0",
@@ -276,13 +292,13 @@ app.post("/message", async (req, res) => {
         result: {
           protocolVersion: "2024-11-05",
           serverInfo: MCP_SERVER_INFO,
-          // MCP generally uses capability objects keyed by feature
+          // MCP usually expects capability objects keyed by feature
           capabilities: { tools: {} },
         },
       });
     }
 
-    // 2) tools/list
+    // tools/list
     if (rpc.method === "tools/list") {
       return res.json({
         jsonrpc: "2.0",
@@ -291,9 +307,10 @@ app.post("/message", async (req, res) => {
       });
     }
 
-    // 3) tools/call
+    // tools/call
     if (rpc.method === "tools/call") {
       const { name, arguments: args } = rpc.params || {};
+
       if (!name) {
         return res.json({
           jsonrpc: "2.0",
@@ -304,12 +321,12 @@ app.post("/message", async (req, res) => {
 
       const resultObj = await executeTool(name, args);
 
-      // Optional: emit an SSE event back to that client
+      // Optional: stream an SSE event back to this client
       if (clientId && sseClients.has(clientId)) {
         sendSSE(sseClients.get(clientId).res, "tool_result", {
           tool: name,
           result: resultObj,
-          timestamp: new Date().toISOString(),
+          timestamp: nowIso(),
         });
       }
 
@@ -329,53 +346,38 @@ app.post("/message", async (req, res) => {
       error: { code: -32601, message: `Method not found: ${rpc.method}` },
     });
   } catch (err) {
-    console.error("❌ /message error:", err);
+    console.error("❌ MCP error:", err);
     return res.status(500).json({
       jsonrpc: "2.0",
       id: rpc.id ?? null,
       error: { code: -32000, message: err.message || "Server error" },
     });
   }
-});
+}
 
-/** -------------------------
- * Your existing "REST MCP" endpoints (optional)
- * Leaving these in place for backwards compatibility.
- * ------------------------*/
-app.post("/mcp/initialize", (req, res) => {
-  console.log("📡 MCP Initialize request received");
-  res.json({
-    protocolVersion: "2024-11-05",
-    serverInfo: MCP_SERVER_INFO,
-    capabilities: MCP_SERVER_INFO.capabilities,
+// Primary MCP endpoint
+app.get("/mcp", handleMcpSse);
+app.post("/mcp", handleMcpMessage);
+
+// Backwards compatible aliases
+app.get("/sse", handleMcpSse);
+app.post("/message", handleMcpMessage);
+
+// Optional: nicer response if user opens /message in browser
+app.get("/message", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    note: "Use POST for JSON-RPC. For streaming, use GET /mcp or /sse.",
+    mcp: "/mcp",
+    sse: "/sse",
   });
 });
 
-app.post("/mcp/tools/list", (req, res) => {
-  console.log("🔧 MCP Tools list request received");
-  res.json({ tools: TOOLS });
-});
+// --------------------
+// Your existing REST endpoints
+// --------------------
 
-app.post("/mcp/tools/call", async (req, res) => {
-  const { name, arguments: args } = req.body;
-  console.log(`⚡ MCP Tool called: ${name}`, args);
-
-  try {
-    const resultObj = await executeTool(name, args);
-    res.json({
-      content: [{ type: "text", text: JSON.stringify(resultObj, null, 2) }],
-    });
-  } catch (error) {
-    console.error("❌ Tool execution error:", error);
-    res.status(500).json({
-      error: { code: "TOOL_ERROR", message: error.message },
-    });
-  }
-});
-
-/** -------------------------
- * Regular file upload endpoint (web interface / tool usage)
- * ------------------------*/
+// Regular file upload endpoint (for web interface)
 app.post("/upload", upload.any(), (req, res) => {
   try {
     const files = req.files || [];
@@ -403,7 +405,7 @@ app.post("/upload", upload.any(), (req, res) => {
       fileCount: files.length,
       files: processedFiles,
       instructions,
-      timestamp: new Date().toISOString(),
+      timestamp: nowIso(),
     });
 
     res.json({
@@ -413,7 +415,7 @@ app.post("/upload", upload.any(), (req, res) => {
       files: processedFiles,
       instructions,
       metadata,
-      timestamp: new Date().toISOString(),
+      timestamp: nowIso(),
     });
   } catch (error) {
     console.error("❌ Upload error:", error);
@@ -424,64 +426,69 @@ app.post("/upload", upload.any(), (req, res) => {
   }
 });
 
-/** -------------------------
- * Health + info endpoints
- * ------------------------*/
-app.get("/", (req, res) => {
-  res.json({
-    status: "MCP Server Running",
-    message: "Origin Brain Trainer MCP Server",
-    version: "1.0.0",
-    protocol: "MCP with SSE + JSON-RPC /message",
-    activeConnections: sseClients.size,
-    endpoints: {
-      sse: "/sse",
-      message: "/message",
-      initialize: "/mcp/initialize",
-      tools_list: "/mcp/tools/list",
-      tools_call: "/mcp/tools/call",
-      upload: "/upload",
-      files: "/files",
-      health: "/health",
-    },
-    uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-  });
-});
-
-app.get("/health", (req, res) => {
-  res.status(200).send("OK");
-});
-
-/** -------------------------
- * File list + delete endpoints
- * ------------------------*/
+// List files endpoint
 app.get("/files", async (req, res) => {
   try {
     const result = await listFiles();
     res.json(result);
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
   }
 });
 
+// Delete file endpoint
 app.delete("/files/:filename", async (req, res) => {
   try {
     const result = await deleteFile(req.params.filename);
     res.json(result);
   } catch (error) {
-    res.status(404).json({ success: false, error: error.message });
+    res.status(404).json({
+      success: false,
+      error: error.message,
+    });
   }
 });
 
-/** -------------------------
- * Error handling + graceful shutdown
- * ------------------------*/
-app.use((error, req, res, next) => {
-  console.error("❌ Server error:", error);
-  res.status(500).json({ success: false, error: "Internal server error" });
+// Health check
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
 });
 
+// Root info
+app.get("/", (req, res) => {
+  res.json({
+    status: "MCP Server Running",
+    message: "Origin Brain Trainer MCP Server",
+    version: MCP_SERVER_INFO.version,
+    protocol: "MCP via single endpoint /mcp (GET SSE + POST JSON-RPC)",
+    activeConnections: sseClients.size,
+    recommended_mcp_server_url_for_chatgpt: `${getBaseUrl(req)}/mcp`,
+    endpoints: {
+      mcp: "/mcp",
+      sse_alias: "/sse",
+      message_alias: "/message",
+      upload: "/upload",
+      files: "/files",
+      health: "/health",
+    },
+    uptime: process.uptime(),
+    timestamp: nowIso(),
+  });
+});
+
+// Error handling
+app.use((error, req, res, next) => {
+  console.error("❌ Server error:", error);
+  res.status(500).json({
+    success: false,
+    error: "Internal server error",
+  });
+});
+
+// Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("⚠️ SIGTERM received, closing server...");
   sseClients.forEach((client) => {
@@ -497,9 +504,9 @@ app.listen(PORT, () => {
 ╔═══════════════════════════════════════════╗
 ║   🚀 MCP Server Running                   ║
 ║   Port: ${PORT}                              ║
-║   Protocol: MCP with SSE + /message       ║
-║   SSE endpoint: /sse                      ║
-║   Message endpoint: /message              ║
+║   MCP (single endpoint): /mcp             ║
+║   SSE alias: /sse                         ║
+║   Message alias: /message                 ║
 ║   Upload endpoint: /upload                ║
 ╚═══════════════════════════════════════════╝
   `);
